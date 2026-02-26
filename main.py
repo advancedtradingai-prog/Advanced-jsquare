@@ -1,11 +1,9 @@
-
 import asyncio
 import pandas as pd
 import numpy as np
 import joblib
 import os
 import sqlite3
-import json
 import requests
 from datetime import datetime, timedelta
 from collections import deque
@@ -89,9 +87,9 @@ def calculate_adx(df, period=14):
   plus_dm[plus_dm < 0] = 0
   minus_dm[minus_dm < 0] = 0
   
-  tr1 = pd.DataFrame(high - low)
-  tr2 = pd.DataFrame(abs(high - close.shift(1)))
-  tr3 = pd.DataFrame(abs(low - close.shift(1)))
+  tr1 = high - low
+  tr2 = abs(high - close.shift(1))
+  tr3 = abs(low - close.shift(1))
   tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
   
   atr = tr.rolling(window=period).mean()
