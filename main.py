@@ -998,8 +998,7 @@ application = Application.builder().token(TOKEN).build()
 
 application.job_queue.run_repeating(
     auto_retrain,
-    interval=3600,
-    first=3600
+    interval=8600,
 )
 
 application.run_polling()
