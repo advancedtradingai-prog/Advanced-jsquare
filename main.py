@@ -988,16 +988,17 @@ ensemble.add_model('lstm', lstm_model, initial_weight=1.0)
 
 meta_learner = MetaLearner()
 
-trainer = ContinuousTrainer(lstm_model, memory, interval_minutes=60)
-app = Applicationbuilder().token(TOKEN).build()
+trainer = ContinuousTrainer(lstm_model, memory, interval_minutes=120)
+
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+
+app = ApplicationBuilder().token(TOKEN).build()
+
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("subscribe", subscribe))
 app.add_handler(CallbackQueryHandler(button))
 
-job_que= app.job_que
-job_queue.run_repeating(
-    auto_retrain,
-    interval=8600,
-)
+job_queue = app.job_queue
+job_queue.run_repeating(auto_retrain, interval=7200, first=10)
 
-application.run_polling()
+app.run_polling()
