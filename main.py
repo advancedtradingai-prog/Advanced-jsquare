@@ -990,13 +990,16 @@ meta_learner = MetaLearner()
 
 trainer = ContinuousTrainer(lstm_model, memory, interval_minutes=60)
 
-app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("subscribe", subscribe))
 app.add_handler(CallbackQueryHandler(button))
 
-job_queue = app.job_queue
-job_queue.run_repeating(auto_retrain, interval=3600, first=3600)
+application = Application.builder().token(TOKEN).build()
 
-print("Bot starting...")
-app.run_polling()
+application.job_queue.run_repeating(
+    auto_retrain,
+    interval=3600,
+    first=3600
+)
+
+application.run_polling()
