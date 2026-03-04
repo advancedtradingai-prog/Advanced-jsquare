@@ -44,3 +44,4 @@ tensorflow-io-gcs-filesystem
 termcolor
 werkzeug
 feedparser
+textblob
