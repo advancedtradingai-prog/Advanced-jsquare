@@ -43,3 +43,4 @@ tensorflow-estimator
 tensorflow-io-gcs-filesystem
 termcolor
 werkzeug
+feedparser
