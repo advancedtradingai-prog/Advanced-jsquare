@@ -8,22 +8,38 @@ import requests
 from datetime import datetime, timedelta
 from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
 import warnings
+import logging
+import json
+import feedparser
+from textblob import TextBlob
+
 warnings.filterwarnings('ignore')
 
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
 TOKEN = "8209411514:AAEUaPrSHE1XX48TizknSxnXgb-HR8E8bBE"
 TWELVE_KEY = "413f1870be274f7fbfff5ab5d720c5a5"
+NEWS_API_KEY = "YOUR_NEWS_API_KEY"  # Get from newsapi.org or use RSS feeds
 DB_NAME = "xauusd_ai.db"
 MODEL_FILE = "xauusd_model.pkl"
 REGIME_FILE = "market_regime.pkl"
 MEMORY_FILE = "trade_memory.pkl"
 
+# ==================== TECHNICAL INDICATORS ====================
+
 def calculate_rsi(prices, period=14):
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-10)
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
@@ -51,7 +67,7 @@ def calculate_psar(high, low, close, step=0.02, max_step=0.2):
     af = step
     ep = low.iloc[0]
     psar.iloc[0] = close.iloc[0]
-    
+
     for i in range(1, len(close)):
         if bull:
             psar.iloc[i] = psar.iloc[i-1] + af * (ep - psar.iloc[i-1])
@@ -73,44 +89,256 @@ def calculate_psar(high, low, close, step=0.02, max_step=0.2):
             elif low.iloc[i] < ep:
                 ep = low.iloc[i]
                 af = min(af + step, max_step)
-    
     return psar
 
 def calculate_adx(df, period=14):
     high = df['high']
     low = df['low']
     close = df['close']
-    
+
     plus_dm = high.diff()
     minus_dm = -low.diff()
-    
     plus_dm[plus_dm < 0] = 0
     minus_dm[minus_dm < 0] = 0
-    
+
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
     tr3 = abs(low - close.shift(1))
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
     atr = tr.rolling(window=period).mean()
-    
-    plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
-    
+
+    plus_di = 100 * (plus_dm.rolling(window=period).mean() / (atr + 1e-10))
+    minus_di = 100 * (minus_dm.rolling(window=period).mean() / (atr + 1e-10))
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)) * 100
     adx = dx.rolling(window=period).mean()
-    
     return adx
+
+# ==================== SMC/ICT FEATURES ====================
+
+def detect_structure(df, swing=3):
+    """Detect market structure breaks (BOS/CHoCH)"""
+    if len(df) < swing + 2:
+        return 0, None
+    
+    recent_highs = df["high"].rolling(window=swing).max().shift(1)
+    recent_lows = df["low"].rolling(window=swing).min().shift(1)
+    
+    current_close = df["close"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
+    prev_high = recent_highs.iloc[-1]
+    prev_low = recent_lows.iloc[-1]
+    
+    # Bullish BOS/CHoCH
+    if current_close > prev_high and prev_close <= prev_high:
+        return 1, prev_high  # Bullish structure break
+    
+    # Bearish BOS/CHoCH  
+    if current_close < prev_low and prev_close >= prev_low:
+        return -1, prev_low  # Bearish structure break
+    
+    return 0, None
+
+def detect_liquidity_sweep(df, lookback=5):
+    """Detect liquidity sweeps above/below recent highs/lows"""
+    if len(df) < lookback + 2:
+        return 0, None, None
+    
+    recent_high = df["high"].iloc[-lookback-1:-1].max()
+    recent_low = df["low"].iloc[-lookback-1:-1].min()
+    
+    current_high = df["high"].iloc[-1]
+    current_low = df["low"].iloc[-1]
+    current_close = df["close"].iloc[-1]
+    current_open = df["open"].iloc[-1]
+    
+    # Bearish sweep (sweep above highs, close below)
+    if current_high > recent_high and current_close < recent_high and current_close < current_open:
+        return -1, recent_high, current_high
+    
+    # Bullish sweep (sweep below lows, close above)
+    if current_low < recent_low and current_close > recent_low and current_close > current_open:
+        return 1, recent_low, current_low
+    
+    return 0, None, None
+
+def detect_order_blocks(df):
+    """Detect bullish/bearish order blocks"""
+    if len(df) < 3:
+        return 0, None, None
+    
+    # Look at last 3 candles
+    c1, c2, c3 = df["close"].iloc[-3], df["close"].iloc[-2], df["close"].iloc[-1]
+    o1, o2, o3 = df["open"].iloc[-3], df["open"].iloc[-2], df["open"].iloc[-1]
+    h1, l1 = df["high"].iloc[-3], df["low"].iloc[-3]
+    h2, l2 = df["high"].iloc[-2], df["low"].iloc[-2]
+    
+    # Bullish OB: Bearish candle followed by strong bullish engulfing/close above
+    bullish_ob = (c1 < o1) and (c2 > o2) and (c2 > o1) and (c3 > c2)
+    
+    # Bearish OB: Bullish candle followed by strong bearish engulfing/close below  
+    bearish_ob = (c1 > o1) and (c2 < o2) and (c2 < o1) and (c3 < c2)
+    
+    if bullish_ob:
+        return 1, l2, h2  # Bullish OB zone
+    if bearish_ob:
+        return -1, l2, h2  # Bearish OB zone
+    return 0, None, None
+
+def detect_fvg(df):
+    """Detect Fair Value Gaps (imbalances)"""
+    if len(df) < 3:
+        return 0, None, None
+    
+    # Candle 1 and Candle 3 (Candle 2 is the displacement)
+    h1, l1 = df["high"].iloc[-3], df["low"].iloc[-3]
+    h3, l3 = df["high"].iloc[-1], df["low"].iloc[-1]
+    
+    # Bullish FVG: Low of candle 3 > High of candle 1
+    if l3 > h1:
+        return 1, h1, l3  # Bullish imbalance zone
+    
+    # Bearish FVG: High of candle 3 < Low of candle 1  
+    if h3 < l1:
+        return -1, h3, l1  # Bearish imbalance zone
+    
+    return 0, None, None
+
+def detect_supply_demand(df, lookback=10):
+    """Detect supply and demand zones based on strong displacement"""
+    if len(df) < lookback + 2:
+        return 0, None, None
+    
+    # Find strong momentum candles
+    recent = df.iloc[-lookback-1:-1]
+    bodies = abs(recent["close"] - recent["open"])
+    atr = df["atr"].iloc[-1] if "atr" in df.columns else bodies.mean()
+    
+    # Find largest bullish/bearish candle
+    max_bull_idx = (recent["close"] - recent["open"]).idxmax()
+    max_bear_idx = (recent["open"] - recent["close"]).idxmax()
+    
+    max_bull_body = abs(recent.loc[max_bull_idx, "close"] - recent.loc[max_bull_idx, "open"])
+    max_bear_body = abs(recent.loc[max_bear_idx, "open"] - recent.loc[max_bear_idx, "close"])
+    
+    # Demand zone (strong bullish candle)
+    if max_bull_body > atr * 1.5:
+        candle = recent.loc[max_bull_idx]
+        return 1, candle["low"], candle["high"]  # Demand zone
+    
+    # Supply zone (strong bearish candle)
+    if max_bear_body > atr * 1.5:
+        candle = recent.loc[max_bear_idx]
+        return -1, candle["low"], candle["high"]  # Supply zone
+    
+    return 0, None, None
+
+# ==================== NEWS SENTIMENT ====================
+
+class NewsSentimentAnalyzer:
+    def __init__(self):
+        self.sentiment_history = deque(maxlen=50)
+        self.cache = {}
+        self.last_fetch = None
+        
+    def fetch_gold_news(self):
+        """Fetch gold-related news from multiple sources"""
+        try:
+            # Method 1: NewsAPI (replace with your key)
+            # url = f"https://newsapi.org/v2/everything?q=gold+OR+XAUUSD+OR+fed+OR+inflation&language=en&sortBy=publishedAt&pageSize=10&apiKey={NEWS_API_KEY}"
+            # response = requests.get(url, timeout=10)
+            # if response.status_code == 200:
+            #     return response.json().get('articles', [])
+            
+            # Method 2: RSS Feeds (free, no API key needed)
+            feeds = [
+                'https://www.forexlive.com/feed/gold',
+                'https://feeds.reuters.com/reuters/commoditiesNews',
+                'https://www.fxstreet.com/rss/gold'
+            ]
+            
+            articles = []
+            for feed_url in feeds:
+                try:
+                    feed = feedparser.parse(feed_url)
+                    for entry in feed.entries[:5]:
+                        articles.append({
+                            'title': entry.get('title', ''),
+                            'description': entry.get('summary', ''),
+                            'published': entry.get('published', '')
+                        })
+                except:
+                    continue
+            
+            return articles
+            
+        except Exception as e:
+            logger.error(f"News fetch error: {e}")
+            return []
+    
+    def analyze_sentiment(self, text):
+        """Analyze sentiment using TextBlob"""
+        try:
+            blob = TextBlob(text)
+            polarity = blob.sentiment.polarity  # -1 to 1
+            subjectivity = blob.sentiment.subjectivity
+            
+            # Convert to trading sentiment score (-1 to 1)
+            # Positive sentiment = bullish for gold (usually)
+            return polarity, subjectivity
+        except:
+            return 0, 0
+    
+    def get_combined_sentiment(self):
+        """Get aggregated sentiment from recent news"""
+        # Check cache (5 minute cache)
+        if self.last_fetch and (datetime.now() - self.last_fetch).seconds < 300:
+            if self.sentiment_history:
+                return self.sentiment_history[-1]
+        
+        articles = self.fetch_gold_news()
+        if not articles:
+            return 0, 0
+        
+        sentiments = []
+        weights = []
+        
+        for i, article in enumerate(articles):
+            text = f"{article.get('title', '')} {article.get('description', '')}"
+            polarity, subjectivity = self.analyze_sentiment(text)
+            
+            # Weight recent articles higher
+            weight = 1.0 / (i + 1)
+            sentiments.append(polarity * subjectivity)  # Weight by confidence
+            weights.append(weight)
+        
+        if not sentiments:
+            return 0, 0
+        
+        # Weighted average
+        avg_sentiment = np.average(sentiments, weights=weights)
+        confidence = np.mean([abs(s) for s in sentiments])
+        
+        result = (avg_sentiment, confidence)
+        self.sentiment_history.append(result)
+        self.last_fetch = datetime.now()
+        
+        return result
+
+# ==================== TRADE MEMORY ====================
 
 class TradeMemory:
     def __init__(self, max_size=10000):
         self.short_term = deque(maxlen=1000)
         self.long_term = deque(maxlen=max_size)
         self.patterns = {}
-        self.success_rates = {'trending': {'BUY': 0.5, 'SELL': 0.5}, 'ranging': {'BUY': 0.5, 'SELL': 0.5}}
+        self.success_rates = {
+            'trending': {'BUY': 0.5, 'SELL': 0.5}, 
+            'ranging': {'BUY': 0.5, 'SELL': 0.5},
+            'volatile': {'BUY': 0.5, 'SELL': 0.5}
+        }
         self.volatility_memory = deque(maxlen=500)
         self.regime_transitions = deque(maxlen=200)
-        
+
     def add_trade(self, direction, entry, exit_price, result, regime, features):
         trade = {
             'direction': direction,
@@ -126,13 +354,13 @@ class TradeMemory:
         self.long_term.append(trade)
         self._update_success_rates(direction, result, regime)
         self._extract_pattern(features, result)
-        
+
     def _update_success_rates(self, direction, result, regime):
         alpha = 0.1
         if regime in self.success_rates:
             current = self.success_rates[regime][direction]
             self.success_rates[regime][direction] = current + alpha * (result - current)
-        
+
     def _extract_pattern(self, features, result):
         pattern_key = self._create_pattern_key(features)
         if pattern_key not in self.patterns:
@@ -140,23 +368,23 @@ class TradeMemory:
         self.patterns[pattern_key]['total'] += 1
         if result == 1:
             self.patterns[pattern_key]['wins'] += 1
-            
+
     def _create_pattern_key(self, features):
         rsi_bin = int(features.get('rsi', 50) / 10)
         trend_bin = 1 if features.get('ema50', 0) > features.get('ema200', 0) else 0
         vol_bin = int(features.get('atr', 1) * 100)
         return f"{rsi_bin}_{trend_bin}_{vol_bin}"
-        
+
     def get_pattern_success_rate(self, features):
         pattern_key = self._create_pattern_key(features)
         if pattern_key in self.patterns:
             p = self.patterns[pattern_key]
             return p['wins'] / p['total'] if p['total'] > 0 else 0.5
         return 0.5
-        
+
     def get_regime_bias(self, regime, direction):
         return self.success_rates.get(regime, {}).get(direction, 0.5)
-        
+
     def save(self, filepath):
         data = {
             'patterns': self.patterns,
@@ -164,12 +392,17 @@ class TradeMemory:
             'recent_trades': list(self.short_term)[-100:]
         }
         joblib.dump(data, filepath)
-        
+
     def load(self, filepath):
         if os.path.exists(filepath):
-            data = joblib.load(filepath)
-            self.patterns = data.get('patterns', {})
-            self.success_rates = data.get('success_rates', self.success_rates)
+            try:
+                data = joblib.load(filepath)
+                self.patterns = data.get('patterns', {})
+                self.success_rates = data.get('success_rates', self.success_rates)
+            except Exception as e:
+                logger.error(f"Memory load error: {e}")
+
+# ==================== MARKET REGIME DETECTOR ====================
 
 class MarketRegimeDetector:
     def __init__(self):
@@ -179,21 +412,21 @@ class MarketRegimeDetector:
         self.adx_value = 0
         self.regime_history = deque(maxlen=50)
         self.adaptive_thresholds = {'trending': 0.3, 'ranging': 0.15}
-        
+
     def detect(self, df):
         if len(df) < 50:
             return 'ranging'
-            
+
         returns = df['close'].pct_change().dropna()
-        volatility = returns.rolling(20).std().iloc[-1] * np.sqrt(252)
-        
+        volatility = returns.rolling(20).std().iloc[-1] * np.sqrt(252) if len(returns) >= 20 else 0
+
         adx_series = calculate_adx(df)
         adx = adx_series.iloc[-1]
         self.adx_value = adx if not pd.isna(adx) else 0
         self.trend_strength = self.adx_value
-        
-        price_range = (df['high'].rolling(20).max().iloc[-1] - df['low'].rolling(20).min().iloc[-1]) / df['close'].iloc[-1]
-        
+
+        price_range = (df['high'].rolling(20).max().iloc[-1] - df['low'].rolling(20).min().iloc[-1]) / df['close'].iloc[-1] if len(df) >= 20 else 0
+
         if self.adx_value > 25 and volatility > 0.15:
             self.regime = 'trending'
         elif self.adx_value < 20 and price_range < 0.02:
@@ -202,50 +435,47 @@ class MarketRegimeDetector:
             self.regime = 'volatile'
         else:
             self.regime = 'mixed'
-            
+
         self.regime_history.append(self.regime)
         self._adapt_thresholds()
-        
         return self.regime
-        
+
     def _adapt_thresholds(self):
         if len(self.regime_history) < 20:
             return
         recent_regimes = list(self.regime_history)[-20:]
         trending_ratio = recent_regimes.count('trending') / len(recent_regimes)
-        
+
         if trending_ratio > 0.6:
             self.adaptive_thresholds['trending'] = max(0.25, self.adaptive_thresholds['trending'] - 0.01)
         elif trending_ratio < 0.3:
             self.adaptive_thresholds['trending'] = min(0.35, self.adaptive_thresholds['trending'] + 0.01)
 
+    def save(self, filepath):
+        joblib.dump(self, filepath)
+
+# ==================== DEEP LEARNING MODEL ====================
+
 class DeepLearningModel:
     def __init__(self, input_dim=20, sequence_length=10, hidden_dim=64, attention_heads=4):
-        # Define ALL attributes FIRST before using them
         self.input_dim = input_dim
         self.sequence_length = sequence_length
         self.hidden_dim = hidden_dim
         self.attention_heads = attention_heads
-        
-        # Ensure hidden_dim is divisible by attention_heads for proper attention mechanism
+
         if self.hidden_dim % self.attention_heads != 0:
-            # Adjust hidden_dim to be divisible by attention_heads
             self.hidden_dim = (self.hidden_dim // self.attention_heads) * self.attention_heads
             if self.hidden_dim == 0:
                 self.hidden_dim = self.attention_heads
-        
+
         self.learning_rate = 0.001
         self.momentum = 0.9
-        self.velocity = None  # Will be initialized in _initialize_weights
-        
-        # Now initialize weights AFTER all attributes are defined
         self.weights = self._initialize_weights()
         self.velocity = {k: np.zeros_like(v) for k, v in self.weights.items()}
-        
+
     def _initialize_weights(self):
         np.random.seed(42)
-        hidden = self.hidden_dim  # Use the instance attribute
-        head_dim = hidden // self.attention_heads
+        hidden = self.hidden_dim
         
         return {
             'Wf': np.random.randn(self.input_dim, hidden) * 0.01,
@@ -261,90 +491,65 @@ class DeepLearningModel:
             'bo': np.zeros((1, hidden)),
             'bc': np.zeros((1, hidden)),
             'W_attn': np.random.randn(hidden, self.attention_heads) * 0.01,
-            'W_out': np.random.randn(hidden, 1) * 0.01,  # Changed: use full hidden dim, not multiplied by heads
+            'W_out': np.random.randn(hidden, 1) * 0.01,
             'b_out': np.zeros((1, 1))
         }
-        
+
+    def _sigmoid(self, x):
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+
     def _lstm_cell(self, x, h_prev, c_prev):
         Wf, Wi, Wo, Wc = self.weights['Wf'], self.weights['Wi'], self.weights['Wo'], self.weights['Wc']
         Uf, Ui, Uo, Uc = self.weights['Uf'], self.weights['Ui'], self.weights['Uo'], self.weights['Uc']
         bf, bi, bo, bc = self.weights['bf'], self.weights['bi'], self.weights['bo'], self.weights['bc']
-        
+
         f = self._sigmoid(x @ Wf + h_prev @ Uf + bf)
         i = self._sigmoid(x @ Wi + h_prev @ Ui + bi)
         o = self._sigmoid(x @ Wo + h_prev @ Uo + bo)
         c_tilde = np.tanh(x @ Wc + h_prev @ Uc + bc)
-        
+
         c = f * c_prev + i * c_tilde
         h = o * np.tanh(c)
-        
         return h, c
-        
-    def _sigmoid(self, x):
-        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
-        
-    def _attention(self, hidden_states):
-        if len(hidden_states) == 0:
-            return np.zeros((1, self.hidden_dim))
-        
-        stacked = np.vstack(hidden_states)  # Shape: (seq_len, hidden_dim)
-        scores = stacked @ self.weights['W_attn']  # Shape: (seq_len, attention_heads)
-        weights = self._softmax(scores)  # Shape: (seq_len, attention_heads)
-        
-        # Multi-head attention: compute context for each head
-        head_dim = self.hidden_dim // self.attention_heads
-        context_vectors = []
-        
-        for i in range(self.attention_heads):
-            # Get weights for this head: (seq_len, 1)
-            head_weights = weights[:, i:i+1]
-            # Weighted sum of hidden states: (hidden_dim,)
-            context = np.sum(stacked * head_weights, axis=0)
-            context_vectors.append(context)
-        
-        # Concatenate all head contexts
-        full_context = np.concatenate(context_vectors).reshape(1, -1)
-        
-        # Project back to hidden_dim if needed (optional, here we just use the concatenated version)
-        # For simplicity, we'll use the average or just the concatenated version
-        # But W_out expects (hidden_dim, 1), so we need to match dimensions
-        
-        # Actually, let's use mean of contexts to match W_out dimensions
-        return np.mean(np.array(context_vectors), axis=0).reshape(1, self.hidden_dim)
-        
+
     def _softmax(self, x):
         exp_x = np.exp(x - np.max(x, axis=0, keepdims=True))
         return exp_x / (np.sum(exp_x, axis=0, keepdims=True) + 1e-10)
-        
+
+    def _attention(self, hidden_states):
+        if len(hidden_states) == 0:
+            return np.zeros((1, self.hidden_dim))
+
+        stacked = np.vstack(hidden_states)
+        scores = stacked @ self.weights['W_attn']
+        weights = self._softmax(scores)
+
+        head_dim = self.hidden_dim // self.attention_heads
+        context_vectors = []
+
+        for i in range(self.attention_heads):
+            head_weights = weights[:, i:i+1]
+            context = np.sum(stacked * head_weights, axis=0)
+            context_vectors.append(context)
+
+        return np.mean(np.array(context_vectors), axis=0).reshape(1, self.hidden_dim)
+
     def forward(self, sequence):
-        # sequence shape: (batch_size, sequence_length, input_dim) or flattened
-        # Handle different input shapes
         if isinstance(sequence, np.ndarray):
             if sequence.ndim == 1:
-                # Single timestep: reshape to (1, input_dim)
                 sequence = sequence.reshape(1, -1)
-            elif sequence.ndim == 2 and sequence.shape[0] == 1:
-                # Already (1, features) - single timestep
-                pass
-            elif sequence.ndim == 2:
-                # (sequence_length, input_dim) - multiple timesteps
-                pass
             elif sequence.ndim == 3:
-                # (batch, seq, features) - take first batch
                 sequence = sequence[0]
-        
+
         h = np.zeros((1, self.hidden_dim))
         c = np.zeros((1, self.hidden_dim))
         hidden_states = []
-        
-        # Ensure sequence is iterable of timesteps
+
         if sequence.ndim == 2 and sequence.shape[0] <= self.sequence_length:
-            # sequence is (seq_len, input_dim)
             seq_len = min(sequence.shape[0], self.sequence_length)
             for t in range(seq_len):
-                x = sequence[t:t+1, :]  # Shape: (1, input_dim)
+                x = sequence[t:t+1, :]
                 if x.shape[1] != self.input_dim:
-                    # Pad if necessary
                     if x.shape[1] < self.input_dim:
                         padding = np.zeros((1, self.input_dim - x.shape[1]))
                         x = np.concatenate([x, padding], axis=1)
@@ -353,7 +558,6 @@ class DeepLearningModel:
                 h, c = self._lstm_cell(x, h, c)
                 hidden_states.append(h)
         else:
-            # Single timestep or reshaped
             x = sequence.reshape(1, -1)
             if x.shape[1] != self.input_dim:
                 if x.shape[1] < self.input_dim:
@@ -363,72 +567,83 @@ class DeepLearningModel:
                     x = x[:, :self.input_dim]
             h, c = self._lstm_cell(x, h, c)
             hidden_states.append(h)
-            
+
         context = self._attention(hidden_states)
         output = self._sigmoid(context @ self.weights['W_out'] + self.weights['b_out'])
-        
         return float(output[0, 0])
-        
+
     def train_step(self, sequence, target):
         prediction = self.forward(sequence)
         error = target - prediction
-        
+
         for key in self.weights:
             gradient = np.random.randn(*self.weights[key].shape) * error * 0.001
             self.velocity[key] = self.momentum * self.velocity[key] + gradient
             self.weights[key] += self.learning_rate * self.velocity[key]
-            
+
         return error ** 2
-        
+
     def save(self, filepath):
         joblib.dump({
-            'weights': self.weights, 
+            'weights': self.weights,
             'velocity': self.velocity,
             'input_dim': self.input_dim,
             'sequence_length': self.sequence_length,
             'hidden_dim': self.hidden_dim,
             'attention_heads': self.attention_heads
         }, filepath)
-        
+
     def load(self, filepath):
         if os.path.exists(filepath):
-            data = joblib.load(filepath)
-            self.weights = data['weights']
-            self.velocity = data['velocity']
-            # Restore architecture parameters if saved
-            self.input_dim = data.get('input_dim', self.input_dim)
-            self.sequence_length = data.get('sequence_length', self.sequence_length)
-            self.hidden_dim = data.get('hidden_dim', self.hidden_dim)
-            self.attention_heads = data.get('attention_heads', self.attention_heads)
+            try:
+                data = joblib.load(filepath)
+                self.weights = data['weights']
+                self.velocity = data['velocity']
+                self.input_dim = data.get('input_dim', self.input_dim)
+                self.sequence_length = data.get('sequence_length', self.sequence_length)
+                self.hidden_dim = data.get('hidden_dim', self.hidden_dim)
+                self.attention_heads = data.get('attention_heads', self.attention_heads)
+            except Exception as e:
+                logger.error(f"Model load error: {e}")
+
+# ==================== META LEARNER & ENSEMBLE ====================
 
 class MetaLearner:
     def __init__(self):
-        self.strategy_weights = {'momentum': 0.25, 'mean_reversion': 0.25, 'breakout': 0.25, 'ml': 0.25}
+        self.strategy_weights = {
+            'momentum': 0.25, 
+            'mean_reversion': 0.25, 
+            'breakout': 0.25, 
+            'ml': 0.25,
+            'smc': 0.0  # Added SMC strategy
+        }
         self.performance_history = {k: deque(maxlen=50) for k in self.strategy_weights}
         self.learning_rate = 0.1
-        
+
     def update_weights(self, strategy, profit):
+        if strategy not in self.performance_history:
+            return
+            
         self.performance_history[strategy].append(profit)
-        
+
         if len(self.performance_history[strategy]) >= 10:
-            avg_perf = np.mean(list(self.performance_history[strategy])[-10:])
-            
-            total_perf = sum(np.mean(list(h)[-10:]) if len(h) >= 10 else 0 
+            total_perf = sum(np.mean(list(h)[-10:]) if len(h) >= 10 else 0.25 
                            for h in self.performance_history.values())
-            
+
             if total_perf > 0:
                 for s in self.strategy_weights:
-                    target_weight = np.mean(list(self.performance_history[s])[-10:]) / total_perf if len(self.performance_history[s]) >= 10 else 0.25
+                    hist = self.performance_history[s]
+                    target_weight = np.mean(list(hist)[-10:]) / total_perf if len(hist) >= 10 else 0.2
                     self.strategy_weights[s] += self.learning_rate * (target_weight - self.strategy_weights[s])
-                    
+
             total = sum(self.strategy_weights.values())
             for s in self.strategy_weights:
                 self.strategy_weights[s] /= total
-                
+
     def get_combined_signal(self, signals):
         combined = 0
         for strategy, signal in signals.items():
-            weight = self.strategy_weights.get(strategy, 0.25)
+            weight = self.strategy_weights.get(strategy, 0.2)
             combined += signal * weight
         return combined
 
@@ -437,12 +652,12 @@ class AdaptiveEnsemble:
         self.models = {}
         self.model_weights = {}
         self.error_history = {}
-        
+
     def add_model(self, name, model, initial_weight=1.0):
         self.models[name] = model
         self.model_weights[name] = initial_weight
         self.error_history[name] = deque(maxlen=100)
-        
+
     def predict(self, features, regime):
         predictions = {}
         
@@ -451,16 +666,16 @@ class AdaptiveEnsemble:
                 if name == 'lstm':
                     pred = model.forward(features)
                 else:
-                    pred = model.predict_proba(features.reshape(1, -1))[0][1] if hasattr(model, 'predict_proba') else 0.5
+                    pred = 0.5
                 predictions[name] = pred
             except Exception as e:
                 predictions[name] = 0.5
-                
+
         weighted_sum = sum(predictions[name] * self.model_weights[name] for name in predictions)
         total_weight = sum(self.model_weights[name] for name in predictions)
         
         return weighted_sum / total_weight if total_weight > 0 else 0.5
-        
+
     def update_weights(self, predictions, actual):
         for name, pred in predictions.items():
             error = abs(pred - actual)
@@ -469,10 +684,12 @@ class AdaptiveEnsemble:
             if len(self.error_history[name]) >= 10:
                 recent_error = np.mean(list(self.error_history[name])[-10:])
                 self.model_weights[name] = 1 / (recent_error + 0.01)
-                
+
         total = sum(self.model_weights.values())
         for name in self.model_weights:
             self.model_weights[name] /= total
+
+# ==================== CONTINUOUS TRAINER ====================
 
 class ContinuousTrainer:
     def __init__(self, model, memory, interval_minutes=60):
@@ -482,19 +699,18 @@ class ContinuousTrainer:
         self.last_train_time = datetime.now() - timedelta(hours=2)
         self.batch_size = 32
         self.min_samples = 50
-        
+
     def should_train(self):
         return (datetime.now() - self.last_train_time).total_seconds() / 60 >= self.interval
-        
+
     def train(self, df, regime_detector):
         if len(self.memory.long_term) < self.min_samples:
             return False
-            
+
         recent_trades = list(self.memory.long_term)[-200:]
-        
         sequences = []
         targets = []
-        
+
         for i in range(len(recent_trades) - 5):
             if i < len(df) - 5:
                 try:
@@ -504,10 +720,10 @@ class ContinuousTrainer:
                         targets.append(recent_trades[i]['result'])
                 except Exception:
                     continue
-                    
+
         if len(sequences) < self.batch_size:
             return False
-            
+
         indices = np.random.choice(len(sequences), min(self.batch_size, len(sequences)), replace=False)
         
         total_loss = 0
@@ -516,10 +732,10 @@ class ContinuousTrainer:
             target = targets[idx]
             loss = self.model.train_step(seq, target)
             total_loss += loss
-            
+
         self.last_train_time = datetime.now()
         return True
-        
+
     def online_update(self, features, result, learning_rate=0.01):
         target = result
         prediction = self.model.forward(features.reshape(1, -1))
@@ -527,6 +743,8 @@ class ContinuousTrainer:
         
         for key in self.model.weights:
             self.model.weights[key] += learning_rate * error * np.random.randn(*self.model.weights[key].shape) * 0.001
+
+# ==================== DATABASE & DATA FETCHING ====================
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -560,33 +778,34 @@ def fetch_data(interval="15min", outputsize=500):
         "outputsize": outputsize,
         "apikey": TWELVE_KEY
     }
-    
+
     try:
         r = requests.get(url, params=params, timeout=30)
         data = r.json()
-        
+
         if "values" not in data:
             raise Exception(f"API Error: {data.get('message', 'Unknown error')}")
-            
+
         df = pd.DataFrame(data["values"])
         df["datetime"] = pd.to_datetime(df["datetime"])
-        
+
         numeric_cols = ["open", "high", "low", "close"]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        
+
         if "volume" in df.columns:
             df["volume"] = pd.to_numeric(df["volume"], errors='coerce').fillna(0)
         else:
             df["volume"] = 1000
-            
+
         df = df.dropna(subset=["open", "high", "low", "close"])
         df = df.iloc[::-1].reset_index(drop=True)
         
         return df
-        
+
     except Exception as e:
+        logger.error(f"Data fetch failed: {str(e)}")
         raise Exception(f"Data fetch failed: {str(e)}")
 
 def add_indicators(df):
@@ -600,95 +819,15 @@ def add_indicators(df):
     df["adx"] = calculate_adx(df)
     df["bull_engulf"] = ((df["close"] > df["open"]) & (df["close"].shift(1) < df["open"].shift(1)) & (df["close"] > df["open"].shift(1))).astype(int)
     df["bear_engulf"] = ((df["close"] < df["open"]) & (df["close"].shift(1) > df["open"].shift(1)) & (df["close"] < df["open"].shift(1))).astype(int)
-    
-    df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    df["vwap"] = (df["close"] * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-10)
     df["momentum"] = df["close"].diff(10)
     df["volatility"] = df["close"].rolling(20).std()
-    
+
     df.dropna(inplace=True)
     return df
 
-def detect_structure(df, swing=3):
-    if len(df) < swing + 1:
-        return 0
-    highs = df["high"].iloc[-swing:]
-    lows = df["low"].iloc[-swing:]
-    
-    if df["close"].iloc[-1] > max(highs[:-1]) and df["close"].iloc[-2] < max(highs[:-1]):
-        return 1
-    if df["close"].iloc[-1] < min(lows[:-1]) and df["close"].iloc[-2] > min(lows[:-1]):
-        return -1
-    return 0
-
-def detect_liquidity_sweep(df, threshold=0.5):
-    if len(df) < 5:
-        return 0, None
-    
-    prev_high = df["high"].iloc[-3:-1].max()
-    prev_low = df["low"].iloc[-3:-1].min()
-    
-    ch = df["high"].iloc[-1]
-    cl = df["low"].iloc[-1]
-    cc = df["close"].iloc[-1]
-    co = df["open"].iloc[-1]
-    
-    body = abs(cc - co)
-    atr = df["atr"].iloc[-2] if len(df) > 1 else 1
-    
-    upper_sweep = ch > prev_high and cc < prev_high and body > threshold * atr
-    lower_sweep = cl < prev_low and cc > prev_low and body > threshold * atr
-    
-    if upper_sweep:
-        return -1, prev_high
-    if lower_sweep:
-        return 1, prev_low
-    return 0, None
-
-def detect_order_blocks(df):
-    if len(df) < 3:
-        return 0, None, None
-    
-    c1, c2, c3 = df["close"].iloc[-3], df["close"].iloc[-2], df["close"].iloc[-1]
-    o1, o2, o3 = df["open"].iloc[-3], df["open"].iloc[-2], df["open"].iloc[-1]
-    h2, l2 = df["high"].iloc[-2], df["low"].iloc[-2]
-    
-    bullish_ob = (c2 > o2) and (c1 < o1) and (c2 > o1) and (c3 > c2)
-    bearish_ob = (c2 < o2) and (c1 > o1) and (c2 < o1) and (c3 < c2)
-    
-    if bullish_ob:
-        return 1, l2, h2
-    if bearish_ob:
-        return -1, l2, h2
-    return 0, None, None
-
-def detect_fvg(df):
-    if len(df) < 3:
-        return 0, None, None
-    
-    h1, l1 = df["high"].iloc[-3], df["low"].iloc[-3]
-    h2, l2 = df["high"].iloc[-2], df["low"].iloc[-2]
-    h3, l3 = df["high"].iloc[-1], df["low"].iloc[-1]
-    
-    bullish_fvg = l3 > h1
-    bearish_fvg = h3 < l1
-    
-    if bullish_fvg:
-        return 1, h1, l3
-    if bearish_fvg:
-        return -1, h3, l1
-    return 0, None, None
-
-def supply_demand(df):
-    if len(df) < 3:
-        return 0
-    body = abs(df["close"].iloc[-2] - df["open"].iloc[-2])
-    atr = df["atr"].iloc[-2] if len(df) > 1 else 1
-    
-    if body > atr * 1.5:
-        if df["close"].iloc[-2] > df["open"].iloc[-2]:
-            return 1
-        return -1
-    return 0
+# ==================== FEATURE CALCULATION ====================
 
 def calculate_adaptive_features(df, regime_detector):
     regime = regime_detector.detect(df)
@@ -703,115 +842,177 @@ def calculate_adaptive_features(df, regime_detector):
         'adx': df["adx"].iloc[-1] if "adx" in df.columns else 0,
         'trend_strength': regime_detector.trend_strength,
         'volatility': df["volatility"].iloc[-1] if 'volatility' in df.columns else 1,
-        'momentum': df["momentum"].iloc[-1] if 'momentum' in df.columns else 0
+        'momentum': df["momentum"].iloc[-1] if 'momentum' in df.columns else 0,
+        'close': df["close"].iloc[-1],
+        'open': df["open"].iloc[-1],
+        'high': df["high"].iloc[-1],
+        'low': df["low"].iloc[-1]
     }
-    
+
     if regime == 'trending':
         features['trend_alignment'] = 1 if features['ema50'] > features['ema200'] else -1
         features['momentum_factor'] = abs(features['momentum']) / (features['atr'] + 1e-6)
     else:
         features['mean_reversion_potential'] = abs(features['rsi'] - 50) / 50
-        features['range_position'] = (df["close"].iloc[-1] - df["low"].rolling(20).min().iloc[-1]) / \
-                                    (df["high"].rolling(20).max().iloc[-1] - df["low"].rolling(20).min().iloc[-1] + 1e-6)
-    
+        range_high = df["high"].rolling(20).max().iloc[-1] if len(df) >= 20 else features['high']
+        range_low = df["low"].rolling(20).min().iloc[-1] if len(df) >= 20 else features['low']
+        features['range_position'] = (features['close'] - range_low) / (range_high - range_low + 1e-6)
+
     return features, regime
 
-def generate_signal(df15m, df1h, df4h, ensemble, memory, regime_detector, meta_learner):
+# ==================== SIGNAL GENERATION ====================
+
+def generate_signal(df15m, df1h, df4h, ensemble, memory, regime_detector, meta_learner, sentiment_analyzer):
+    # Get multi-timeframe features
     features_15m, regime_15m = calculate_adaptive_features(df15m, regime_detector)
     features_1h, regime_1h = calculate_adaptive_features(df1h, regime_detector)
     features_4h, regime_4h = calculate_adaptive_features(df4h, regime_detector)
     
+    # Use 4H regime as primary
     regime = regime_4h
     adx_value = features_4h.get('adx', 0)
     
+    # ADX filter
     if adx_value < 18:
-        return "HOLD", None, None, None, None, 0, regime, features_15m
+        return "HOLD", None, None, None, None, 0, regime, features_15m, 0, "ADX too low"
     
-    bias = detect_structure(df4h)
-    structure_15m = detect_structure(df15m)
-    sweep, sweep_level = detect_liquidity_sweep(df15m)
+    # SMC/ICT Analysis on 15m
+    structure_bias, structure_level = detect_structure(df15m)
+    sweep, sweep_level, sweep_wick = detect_liquidity_sweep(df15m)
     ob_dir, ob_low, ob_high = detect_order_blocks(df15m)
     fvg_dir, fvg_low, fvg_high = detect_fvg(df15m)
-    zone = supply_demand(df15m)
+    sd_dir, sd_low, sd_high = detect_supply_demand(df15m)
     
+    # News sentiment
+    sentiment_score, sentiment_conf = sentiment_analyzer.get_combined_sentiment()
+    
+    # Build feature vector for ML
     feature_vector = np.array([
         features_15m['rsi'] / 100,
-        features_15m['macd'] / 10,
-        features_15m['atr'] / 10,
+        np.tanh(features_15m['macd'] / 10),
+        np.tanh(features_15m['atr'] / 10),
         features_15m['bop'],
         1 if features_15m['ema50'] > features_15m['ema200'] else 0,
         features_15m['trend_strength'] / 50,
-        bias,
-        structure_15m,
-        sweep,
+        structure_bias,
+        1 if sweep > 0 else (-1 if sweep < 0 else 0),
         ob_dir,
         fvg_dir,
-        zone
+        sd_dir,
+        sentiment_score,  # Add sentiment
+        features_1h['rsi'] / 100,
+        features_4h['rsi'] / 100,
+        1 if features_4h['ema50'] > features_4h['ema200'] else 0,
+        0,  # Reserved
+        0,  # Reserved
+        0,  # Reserved
+        0,  # Reserved
+        0   # Reserved
     ])
     
+    # Pad to 20 features
     if len(feature_vector) < 20:
         feature_vector = np.pad(feature_vector, (0, 20 - len(feature_vector)), mode='constant')
     
+    # ML Prediction
     ml_prediction = ensemble.predict(feature_vector[:20].reshape(1, 20), regime)
     
+    # Pattern memory
     pattern_confidence = memory.get_pattern_success_rate(features_15m)
     regime_bias = memory.get_regime_bias(regime, 'BUY')
     
+    # Strategy signals
     strategy_signals = {
         'momentum': 0.5 + (features_15m['macd'] / 20),
         'mean_reversion': 1 - abs(features_15m['rsi'] - 50) / 50,
         'breakout': 0.7 if sweep != 0 else 0.3,
-        'ml': ml_prediction
+        'ml': ml_prediction,
+        'smc': 0.5 + (structure_bias * 0.3) + (sweep * 0.2)  # SMC strategy
     }
     
+    # Combine signals
     combined_signal = meta_learner.get_combined_signal(strategy_signals)
     
+    # Apply sentiment filter
+    if abs(sentiment_score) > 0.3:  # Strong sentiment
+        sentiment_adjustment = sentiment_score * 0.2
+        combined_signal += sentiment_adjustment
+    
+    # Determine direction with SMC confirmation
     direction = "BUY" if combined_signal > 0.5 else "SELL"
     
-    if bias < 0:
-        direction = "SELL"
-    elif bias > 0:
+    # SMC Confirmation logic
+    confirmations = 0
+    reasons = []
+    
+    if structure_bias > 0:
+        confirmations += 1
+        reasons.append("Bullish Structure")
+    elif structure_bias < 0:
+        confirmations -= 1
+        reasons.append("Bearish Structure")
+    
+    if sweep > 0:
+        confirmations += 1
+        reasons.append("Bullish Liquidity Sweep")
+    elif sweep < 0:
+        confirmations -= 1
+        reasons.append("Bearish Liquidity Sweep")
+    
+    if ob_dir > 0:
+        confirmations += 1
+        reasons.append("Bullish OB")
+    elif ob_dir < 0:
+        confirmations -= 1
+        reasons.append("Bearish OB")
+    
+    if fvg_dir > 0:
+        confirmations += 1
+        reasons.append("Bullish FVG")
+    elif fvg_dir < 0:
+        confirmations -= 1
+        reasons.append("Bearish FVG")
+    
+    if sd_dir > 0:
+        confirmations += 1
+        reasons.append("Demand Zone")
+    elif sd_dir < 0:
+        confirmations -= 1
+        reasons.append("Supply Zone")
+    
+    # Override based on strong SMC signals
+    if confirmations >= 2:
         direction = "BUY"
-    
-    if structure_15m < 0:
+    elif confirmations <= -2:
         direction = "SELL"
-    elif structure_15m > 0:
-        direction = "BUY"
+    elif confirmations == 0 and abs(combined_signal - 0.5) < 0.1:
+        direction = "HOLD"
     
-    if sweep == -1:
-        direction = "SELL"
-    elif sweep == 1:
-        direction = "BUY"
-    
-    if ob_dir != 0:
-        direction = "BUY" if ob_dir == 1 else "SELL"
-    
-    if fvg_dir != 0:
-        direction = "BUY" if fvg_dir == 1 else "SELL"
-    
-    if zone == -1:
-        direction = "SELL"
-    elif zone == 1:
-        direction = "BUY"
-    
+    # PSAR and MACD filters
     psar_candle = df15m["psar"].iloc[-1] if "psar" in df15m.columns else df15m["close"].iloc[-1]
     macd_c = df15m["macd"].iloc[-1] if "macd" in df15m.columns else 0
     macd_signal_c = df15m["macd_signal"].iloc[-1] if "macd_signal" in df15m.columns else 0
     entry_candle = df15m.iloc[-1]
     
+    # Trend alignment check
     if direction == "BUY" and entry_candle["close"] < psar_candle:
-        direction = "SELL"
-    elif direction == "SELL" and entry_candle["close"] > psar_candle:
-        direction = "BUY"
+        if confirmations < 2:  # Only override if weak SMC confirmation
+            direction = "HOLD"
+            reasons.append("Against PSAR")
     
-    if direction == "BUY" and macd_c < macd_signal_c:
-        direction = "SELL"
-    elif direction == "SELL" and macd_c > macd_signal_c:
-        direction = "BUY"
+    if direction == "SELL" and entry_candle["close"] > psar_candle:
+        if confirmations > -2:
+            direction = "HOLD"
+            reasons.append("Against PSAR")
     
+    if direction == "HOLD":
+        return direction, None, None, None, None, 0, regime, features_15m, sentiment_score, " | ".join(reasons) if reasons else "No setup"
+    
+    # Calculate levels
     entry = entry_candle["close"]
     atr = df15m["atr"].iloc[-1] if "atr" in df15m.columns else entry * 0.001
     
+    # Dynamic risk based on regime
     if regime == 'trending':
         risk_multiplier = 2.0
         tp_multiplier = 3.0
@@ -822,16 +1023,38 @@ def generate_signal(df15m, df1h, df4h, ensemble, memory, regime_detector, meta_l
         risk_multiplier = 1.5
         tp_multiplier = 2.0
     
-    tp1 = entry + atr * tp_multiplier if direction == "BUY" else entry - atr * tp_multiplier
-    tp2 = entry + atr * tp_multiplier * 1.5 if direction == "BUY" else entry - atr * tp_multiplier * 1.5
-    sl = entry - atr * risk_multiplier if direction == "BUY" else entry + atr * risk_multiplier
+    # Adjust based on SMC
+    if fvg_dir != 0 and fvg_low and fvg_high:
+        # Use FVG for TP/SL reference
+        if direction == "BUY":
+            sl = min(entry - atr * risk_multiplier, fvg_low)
+            tp1 = max(entry + atr * tp_multiplier, fvg_high)
+        else:
+            sl = max(entry + atr * risk_multiplier, fvg_high)
+            tp1 = min(entry - atr * tp_multiplier, fvg_low)
+    else:
+        if direction == "BUY":
+            sl = entry - atr * risk_multiplier
+            tp1 = entry + atr * tp_multiplier
+        else:
+            sl = entry + atr * risk_multiplier
+            tp1 = entry - atr * tp_multiplier
     
-    confidence = combined_signal * pattern_confidence * (0.5 + abs(bias) * 0.5)
-    confidence = min(confidence * 100, 99)
+    tp2 = entry + (tp1 - entry) * 1.5 if direction == "BUY" else entry - (entry - tp1) * 1.5
     
-    return direction, entry, tp1, tp2, sl, round(confidence, 2), regime, features_15m
+    # Confidence calculation
+    base_confidence = combined_signal if direction == "BUY" else (1 - combined_signal)
+    smc_boost = min(abs(confirmations) * 0.1, 0.2)
+    confidence = (base_confidence * pattern_confidence * (0.5 + abs(structure_bias) * 0.5) + smc_boost) * 100
+    confidence = min(confidence, 99)
+    
+    reason_str = " | ".join(reasons) if reasons else "Technical Setup"
+    
+    return direction, entry, tp1, tp2, sl, round(confidence, 2), regime, features_15m, sentiment_score, reason_str
 
-def backtest(df, ensemble, memory, regime_detector, meta_learner, n_simulations=5):
+# ==================== BACKTESTING ====================
+
+def backtest(df, ensemble, memory, regime_detector, meta_learner, sentiment_analyzer, n_simulations=3):
     wins = 0
     total = 0
     returns = []
@@ -844,11 +1067,11 @@ def backtest(df, ensemble, memory, regime_detector, meta_learner, n_simulations=
             sub = df.iloc[:i].copy()
             
             try:
-                direction, entry, tp1, tp2, sl, conf, regime, features = generate_signal(
-                    sub, sub, sub, ensemble, memory, regime_detector, meta_learner
+                direction, entry, tp1, tp2, sl, conf, regime, features, sent, reasons = generate_signal(
+                    sub, sub, sub, ensemble, memory, regime_detector, meta_learner, sentiment_analyzer
                 )
                 
-                if direction == "HOLD":
+                if direction == "HOLD" or entry is None:
                     continue
                 
                 future = df["close"].iloc[i + 3]
@@ -867,19 +1090,21 @@ def backtest(df, ensemble, memory, regime_detector, meta_learner, n_simulations=
                     
             except Exception as e:
                 continue
-                
+        
         if sim_total > 0:
             returns.append(sim_wins / sim_total)
             wins += sim_wins
             total += sim_total
-            
+    
     if total == 0:
-        return 0, 0
-        
+        return 0, 0, 0
+    
     win_rate = (wins / total) * 100
     sharpe = np.mean(returns) / (np.std(returns) + 1e-6) if len(returns) > 1 else 0
     
-    return round(win_rate, 2), round(sharpe, 2)
+    return round(win_rate, 2), round(sharpe, 2), total
+
+# ==================== TELEGRAM HANDLERS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -889,71 +1114,113 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Force Retrain", callback_data="retrain")]
     ]
     await update.message.reply_text(
-        "XAUUSD Adaptive AI Trading Bot\nDeep Learning + Meta Learning + Continuous Training\nADX Filter: 18+",
+        "🤖 XAUUSD Adaptive AI Trading Bot\n\n"
+        "Features:\n• Deep Learning LSTM + Attention\n• SMC/ICT Analysis (FVG, OB, Liquidity)\n• News Sentiment Analysis\n• Multi-Timeframe Analysis\n• Market Regime Detection\n• Continuous Learning\n\n"
+        "ADX Filter: 18+ | Risk Management: Dynamic",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Processing...")
     
     try:
+        # Fetch all timeframes
         df15m = add_indicators(fetch_data("15min", 500))
         df1h = add_indicators(fetch_data("1h", 500))
         df4h = add_indicators(fetch_data("4h", 500))
         
         if query.data == "signal":
-            direction, entry, tp1, tp2, sl, confidence, regime, features = generate_signal(
-                df15m, df1h, df4h, ensemble, memory, regime_detector, meta_learner
+            direction, entry, tp1, tp2, sl, confidence, regime, features, sentiment, reasons = generate_signal(
+                df15m, df1h, df4h, ensemble, memory, regime_detector, meta_learner, sentiment_analyzer
             )
             
             if direction == "HOLD":
-                await query.edit_message_text(f"HOLD - ADX {round(features.get('adx', 0), 1)} below 18 threshold")
+                await query.edit_message_text(
+                    f"⏸️ **HOLD**\n\n"
+                    f"ADX: {round(features.get('adx', 0), 1)} (below 18 threshold)\n"
+                    f"Regime: {regime}\n"
+                    f"Reason: {reasons}",
+                    parse_mode='Markdown'
+                )
                 return
             
-            text = f"""XAUUSD {direction}
-Entry: {round(entry, 2)}
-TP1: {round(tp1, 2)}
-TP2: {round(tp2, 2)}
-SL: {round(sl, 2)}
-Confidence: {confidence}%
-Regime: {regime}
-ADX: {round(features.get('adx', 0), 1)}
-ML Signal: {round(ensemble.predict(np.array(list(features.values())[:12] + [0] * 8).reshape(1, 20), regime) * 100, 1)}%"""
+            # Get SMC details
+            sweep, _, _ = detect_liquidity_sweep(df15m)
+            fvg_dir, _, _ = detect_fvg(df15m)
+            ob_dir, _, _ = detect_order_blocks(df15m)
             
-            await query.edit_message_text(text)
+            emoji = "🟢" if direction == "BUY" else "🔴"
+            sent_emoji = "📈" if sentiment > 0.2 else ("📉" if sentiment < -0.2 else "➡️")
+            
+            text = (
+                f"{emoji} **XAUUSD {direction}**\n\n"
+                f"📍 Entry: `{round(entry, 2)}`\n"
+                f"🎯 TP1: `{round(tp1, 2)}`\n"
+                f"🎯 TP2: `{round(tp2, 2)}`\n"
+                f"🛡️ SL: `{round(sl, 2)}`\n\n"
+                f"📊 Confidence: {confidence}%\n"
+                f"🧠 Regime: {regime}\n"
+                f"📈 ADX: {round(features.get('adx', 0), 1)}\n"
+                f"📰 Sentiment: {sent_emoji} ({round(sentiment, 2)})\n\n"
+                f"🔍 Setup: {reasons}\n\n"
+                f"Risk/Reward: 1:{round(abs(tp1-entry)/abs(entry-sl), 1)}"
+            )
+            
+            await query.edit_message_text(text, parse_mode='Markdown')
             
         elif query.data == "backtest":
-            win_rate, sharpe = backtest(df15m, ensemble, memory, regime_detector, meta_learner)
-            await query.edit_message_text(f"Win Rate: {win_rate}%\nSharpe Ratio: {sharpe}\nTrades in memory: {len(memory.long_term)}")
+            await query.edit_message_text("⏳ Running backtest on recent data...")
+            win_rate, sharpe, trades = backtest(df15m, ensemble, memory, regime_detector, meta_learner, sentiment_analyzer)
+            
+            await query.edit_message_text(
+                f"📊 **Backtest Results**\n\n"
+                f"Win Rate: {win_rate}%\n"
+                f"Sharpe Ratio: {sharpe}\n"
+                f"Simulated Trades: {trades}\n"
+                f"Trades in Memory: {len(memory.long_term)}",
+                parse_mode='Markdown'
+            )
             
         elif query.data == "status":
-            status_text = f"""Model Status:
-Regime: {regime_detector.regime}
-Trades in memory: {len(memory.long_term)}
-Patterns learned: {len(memory.patterns)}
-Last training: {trainer.last_train_time.strftime('%H:%M:%S')}
-Strategy weights: {meta_learner.strategy_weights}
-ADX Threshold: 18+"""
-            await query.edit_message_text(status_text)
+            status_text = (
+                f"⚙️ **Model Status**\n\n"
+                f"Current Regime: {regime_detector.regime}\n"
+                f"ADX Value: {round(regime_detector.adx_value, 1)}\n"
+                f"Trades in Memory: {len(memory.long_term)}\n"
+                f"Patterns Learned: {len(memory.patterns)}\n"
+                f"Last Training: {trainer.last_train_time.strftime('%H:%M:%S')}\n\n"
+                f"Strategy Weights:\n"
+                f"• Momentum: {round(meta_learner.strategy_weights['momentum'], 2)}\n"
+                f"• Mean Reversion: {round(meta_learner.strategy_weights['mean_reversion'], 2)}\n"
+                f"• Breakout: {round(meta_learner.strategy_weights['breakout'], 2)}\n"
+                f"• ML: {round(meta_learner.strategy_weights['ml'], 2)}\n"
+                f"• SMC: {round(meta_learner.strategy_weights.get('smc', 0), 2)}\n\n"
+                f"ADX Threshold: 18+"
+            )
+            await query.edit_message_text(status_text, parse_mode='Markdown')
             
         elif query.data == "retrain":
+            await query.edit_message_text("⏳ Training model with recent data...")
             success = trainer.train(df15m, regime_detector)
+            
             if success:
-                await query.edit_message_text("Model retrained successfully!")
+                ensemble.models['lstm'].save(MODEL_FILE)
+                memory.save(MEMORY_FILE)
+                await query.edit_message_text("✅ Model retrained and saved successfully!")
             else:
-                await query.edit_message_text("Not enough data for training yet.")
+                await query.edit_message_text("⚠️ Not enough data for training yet (need 50+ trades)")
                 
     except Exception as e:
-        await query.edit_message_text(f"Error: {str(e)}")
+        logger.error(f"Button handler error: {e}")
+        await query.edit_message_text(f"❌ Error: {str(e)}")
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if "subscribers" not in context.application.bot_data:
-        context.application.bot_data["subscribers"] = []
-    if chat_id not in context.application.bot_data["subscribers"]:
-        context.application.bot_data["subscribers"].append(chat_id)
-    await update.message.reply_text("Subscribed to adaptive AI signals")
+    if "subscribers" not in context.bot_data:
+        context.bot_data["subscribers"] = set()
+    context.bot_data["subscribers"].add(chat_id)
+    await update.message.reply_text("✅ Subscribed to adaptive AI signals. You'll receive auto-updates.")
 
 async def auto_retrain(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -963,42 +1230,69 @@ async def auto_retrain(context: ContextTypes.DEFAULT_TYPE):
         if success:
             ensemble.models['lstm'].save(MODEL_FILE)
             memory.save(MEMORY_FILE)
+            regime_detector.save(REGIME_FILE)
             
-            for chat_id in context.bot_data.get("subscribers", []):
-                await context.bot.send_message(chat_id, "Model auto-retrained with new data")
+            for chat_id in context.bot_data.get("subscribers", set()):
+                try:
+                    await context.bot.send_message(
+                        chat_id, 
+                        "🔄 Model auto-retrained with new market data\n"
+                        f"Current Regime: {regime_detector.regime}\n"
+                        f"Patterns: {len(memory.patterns)}"
+                    )
+                except:
+                    continue
     except Exception as e:
-        pass
+        logger.error(f"Auto-retrain error: {e}")
 
-init_db()
+# ==================== MAIN ====================
 
-memory = TradeMemory()
-if os.path.exists(MEMORY_FILE):
-    memory.load(MEMORY_FILE)
+def main():
+    global ensemble, memory, regime_detector, meta_learner, trainer, sentiment_analyzer
+    
+    # Initialize
+    init_db()
+    
+    # Load or create components
+    memory = TradeMemory()
+    if os.path.exists(MEMORY_FILE):
+        memory.load(MEMORY_FILE)
+    
+    regime_detector = MarketRegimeDetector()
+    if os.path.exists(REGIME_FILE):
+        try:
+            regime_detector = joblib.load(REGIME_FILE)
+        except:
+            pass
+    
+    lstm_model = DeepLearningModel(input_dim=20, sequence_length=10)
+    if os.path.exists(MODEL_FILE):
+        lstm_model.load(MODEL_FILE)
+    
+    ensemble = AdaptiveEnsemble()
+    ensemble.add_model('lstm', lstm_model, initial_weight=1.0)
+    
+    meta_learner = MetaLearner()
+    sentiment_analyzer = NewsSentimentAnalyzer()
+    
+    trainer = ContinuousTrainer(lstm_model, memory, interval_minutes=120)
+    
+    # Build application
+    application = ApplicationBuilder().token(TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CallbackQueryHandler(button))
+    
+    # Add job queue
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(auto_retrain, interval=7200, first=10)
+    
+    # Run
+    logger.info("Bot starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-regime_detector = MarketRegimeDetector()
-if os.path.exists(REGIME_FILE):
-    regime_detector = joblib.load(REGIME_FILE)
-
-lstm_model = DeepLearningModel(input_dim=20, sequence_length=10)
-if os.path.exists(MODEL_FILE):
-    lstm_model.load(MODEL_FILE)
-
-ensemble = AdaptiveEnsemble()
-ensemble.add_model('lstm', lstm_model, initial_weight=1.0)
-
-meta_learner = MetaLearner()
-
-trainer = ContinuousTrainer(lstm_model, memory, interval_minutes=120)
-
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
-
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("subscribe", subscribe))
-app.add_handler(CallbackQueryHandler(button))
-
-job_queue = app.job_queue
-job_queue.run_repeating(auto_retrain, interval=7200, first=10)
-
-app.run_polling()
+if __name__ == "__main__":
+    main()
