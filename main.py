@@ -1288,7 +1288,7 @@ def main():
     # Add job queue
     job_queue = application.job_queue
     if job_queue:
-        job_queue.run_repeating(auto_retrain, interval=7200, first=10)
+        job_queue.run_repeating(auto_retrain, interval=7201, first=10)
     
     # Run
     logger.info("Bot starting...")
